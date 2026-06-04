@@ -17,8 +17,14 @@ export default defineConfig({
   },
   projects: [
     { name: 'desktop', use: { ...devices['Desktop Chrome'] } },
-    { name: 'tablet', use: { ...devices['iPad Pro'] } },
-    { name: 'mobile', use: { ...devices['iPhone 14'] } },
+    {
+      name: 'tablet',
+      use: { ...devices['iPad Pro'], browserName: 'chromium' },
+    },
+    {
+      name: 'mobile',
+      use: { ...devices['iPhone 14'], browserName: 'chromium' },
+    },
   ],
   webServer: !isCI
     ? {
