@@ -1,0 +1,17 @@
+{
+  "name": "{{PROJECT_NAME}}",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "check": "npm run lint && npm run test:unit && npm run test:smoke",
+    "lint": "echo '(no lint configured yet — add eslint/stylelint when needed)'",
+    "test:unit": "echo '(no unit tests yet — add vitest when needed)'",
+    "test:smoke": "playwright test --reporter=line",
+    "test:smoke:install": "playwright install --with-deps chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.48.0",
+    "@axe-core/playwright": "^4.10.0"
+  }
+}

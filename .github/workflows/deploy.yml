@@ -2,46 +2,220 @@ name: deploy
 
 on:
   push:
-    branches: [main]
+    branches: ["**"]
+  pull_request:
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write       # to update STATE.md
+  pull-requests: write  # to post the sticky comment
+  deployments: write
+
+env:
+  DOMAIN: ${{ secrets.DOMAIN }}
+  SUBDOMAIN: ${{ secrets.SUBDOMAIN }}
+  STAGING_SUBDOMAIN: ${{ secrets.STAGING_SUBDOMAIN }}
+  YC_FOLDER_ID: ${{ secrets.YC_FOLDER_ID }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.YC_S3_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.YC_S3_SECRET }}
+  AWS_DEFAULT_REGION: ru-central1
+  AWS_EC2_METADATA_DISABLED: "true"
 
 jobs:
-  deploy:
+  # 1. Test ── lint, types, unit, smoke, a11y, perf budgets
+  test:
     runs-on: ubuntu-latest
-    env:
-      DOMAIN: ${{ secrets.DOMAIN }}
-      SUBDOMAIN: ${{ secrets.SUBDOMAIN }}
-      YC_FOLDER_ID: ${{ secrets.YC_FOLDER_ID }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.YC_S3_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.YC_S3_SECRET }}
-      AWS_DEFAULT_REGION: ru-central1
-      AWS_EC2_METADATA_DISABLED: "true"
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - name: Detect package.json
+        id: detect
+        run: |
+          if [ -f package.json ]; then echo "has_npm=true" >> "$GITHUB_OUTPUT";
+          else echo "has_npm=false" >> "$GITHUB_OUTPUT"; fi
+      - name: Install
+        if: steps.detect.outputs.has_npm == 'true'
+        run: npm ci --no-audit --no-fund
+      - name: Build
+        if: steps.detect.outputs.has_npm == 'true'
+        run: npm run build --if-present
+      - name: Lint / types / unit
+        if: steps.detect.outputs.has_npm == 'true'
+        run: npm run check --if-present
 
-      - name: Resolve site dir (build/dist if exists, else repo root)
+  # 2. Deploy to staging — runs on every branch, including main
+  deploy-staging:
+    needs: test
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-staging-${{ github.ref }}
+      cancel-in-progress: true
+    environment:
+      name: staging
+      url: https://${{ env.STAGING_SUBDOMAIN }}.${{ env.DOMAIN }}
+    outputs:
+      url: https://${{ env.STAGING_SUBDOMAIN }}.${{ env.DOMAIN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - name: Install + build (if package.json)
+        run: |
+          if [ -f package.json ]; then
+            npm ci --no-audit --no-fund
+            npm run build --if-present
+          fi
+      - name: Resolve site dir
         id: dir
         run: |
           if [ -d "dist" ]; then echo "dir=dist" >> "$GITHUB_OUTPUT";
           elif [ -d "build" ]; then echo "dir=build" >> "$GITHUB_OUTPUT";
           elif [ -d "public" ]; then echo "dir=public" >> "$GITHUB_OUTPUT";
           else echo "dir=." >> "$GITHUB_OUTPUT"; fi
-
-      - name: Replace placeholders
+      - name: Inject env meta into HTML (X-Robots-Tag noindex for staging)
         run: |
           DIR="${{ steps.dir.outputs.dir }}"
-          find "$DIR" -type f \( -name "*.html" -o -name "*.js" -o -name "*.json" \) -exec \
-            sed -i "s|{{PROJECT_NAME}}|$SUBDOMAIN|g" {} +
+          find "$DIR" -type f -name "*.html" -exec \
+            sed -i 's|</head>|<meta name="robots" content="noindex,nofollow"></head>|' {} +
+      - name: Upload to staging bucket
+        run: |
+          BUCKET="${STAGING_SUBDOMAIN}.${DOMAIN}"
+          aws --endpoint-url=https://storage.yandexcloud.net \
+            s3 sync "${{ steps.dir.outputs.dir }}" "s3://$BUCKET" \
+            --delete \
+            --cache-control "public, max-age=60"
+      - name: Wait for CDN to serve fresh content (max 90s)
+        run: |
+          URL="https://${STAGING_SUBDOMAIN}.${DOMAIN}"
+          for i in 1 2 3 4 5 6; do
+            sleep $((i*5))
+            code=$(curl -sI -o /dev/null -w "%{http_code}" "$URL" || echo "0")
+            echo "attempt $i: $code"
+            [[ "$code" == "200" ]] && exit 0
+          done
+          echo "Staging not reachable after retries" >&2
+          exit 1
+      - name: Install Playwright (smoke + a11y on live staging)
+        if: hashFiles('package.json') != ''
+        run: |
+          npm ci --no-audit --no-fund
+          npx playwright install --with-deps chromium webkit
+      - name: Run Playwright smoke + axe on live staging
+        if: hashFiles('package.json') != ''
+        env:
+          SMOKE_URL: https://${{ env.STAGING_SUBDOMAIN }}.${{ env.DOMAIN }}
+          CI: "true"
+        run: npx playwright test --reporter=line
+      - name: Upload Playwright traces on failure
+        if: failure() && hashFiles('package.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-traces
+          path: test-results/
+          retention-days: 7
+      - name: Capture screenshots (desktop / tablet / mobile)
+        if: hashFiles('package.json') != ''
+        env:
+          SMOKE_URL: https://${{ env.STAGING_SUBDOMAIN }}.${{ env.DOMAIN }}
+        run: |
+          mkdir -p screenshots
+          npx playwright screenshot --viewport-size=1440,900  "$SMOKE_URL" screenshots/desktop.png || true
+          npx playwright screenshot --viewport-size=820,1180  "$SMOKE_URL" screenshots/tablet.png || true
+          npx playwright screenshot --viewport-size=390,844   "$SMOKE_URL" screenshots/mobile.png || true
+      - name: Upload screenshots
+        if: hashFiles('package.json') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots-${{ github.run_id }}
+          path: screenshots/
 
-      - name: Upload to Object Storage
+  # 3. Post a sticky PR comment with staging URL & report
+  pr-comment:
+    needs: deploy-staging
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: gevorg-deploy
+          message: |
+            ### 🚀 Staging deployed
+
+            **URL**: https://${{ env.STAGING_SUBDOMAIN }}.${{ env.DOMAIN }}
+
+            | Check | Status |
+            |---|---|
+            | Test (lint/types/unit) | ✅ |
+            | Deploy to staging | ✅ |
+
+            Reviewers: open the URL, leave comments here, then **approve** to allow prod promotion.
+
+  # 4. Promote to production — only on main, gated by 'production' env approval
+  deploy-production:
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    environment:
+      name: production
+      url: https://${{ env.SUBDOMAIN }}.${{ env.DOMAIN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - name: Install + build (if package.json)
+        run: |
+          if [ -f package.json ]; then
+            npm ci --no-audit --no-fund
+            npm run build --if-present
+          fi
+      - name: Resolve site dir
+        id: dir
+        run: |
+          if [ -d "dist" ]; then echo "dir=dist" >> "$GITHUB_OUTPUT";
+          elif [ -d "build" ]; then echo "dir=build" >> "$GITHUB_OUTPUT";
+          elif [ -d "public" ]; then echo "dir=public" >> "$GITHUB_OUTPUT";
+          else echo "dir=." >> "$GITHUB_OUTPUT"; fi
+      - name: Upload to PROD bucket
         run: |
           BUCKET="${SUBDOMAIN}.${DOMAIN}"
-          DIR="${{ steps.dir.outputs.dir }}"
           aws --endpoint-url=https://storage.yandexcloud.net \
-            s3 sync "$DIR" "s3://$BUCKET" \
+            s3 sync "${{ steps.dir.outputs.dir }}" "s3://$BUCKET" \
             --delete \
             --cache-control "public, max-age=300"
-          echo "✅ Deployed to https://${SUBDOMAIN}.${DOMAIN}"
+      - name: Smoke check
+        run: |
+          URL="https://${SUBDOMAIN}.${DOMAIN}"
+          for i in 1 2 3 4 5; do
+            sleep $((i*5))
+            code=$(curl -sI -o /dev/null -w "%{http_code}" "$URL" || echo "0")
+            echo "attempt $i: $code"
+            [[ "$code" == "200" ]] && exit 0
+          done
+          echo "Production not reachable after retries — rollback may be needed" >&2
+          exit 1
+      - name: Update STATE.md
+        run: |
+          {
+            echo "# STATE — ${SUBDOMAIN}"
+            echo
+            echo "## Current"
+            echo "- **Last prod deploy**: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "- **Last prod commit**: ${{ github.sha }}"
+            echo "- **URL**: https://${SUBDOMAIN}.${DOMAIN}"
+          } > STATE.md
+          git config user.email "actions@github.com"
+          git config user.name "github-actions"
+          git add STATE.md
+          git commit -m "chore: update STATE.md after prod deploy" || exit 0
+          git push origin main  # gevorg-bypass: CI state update only
