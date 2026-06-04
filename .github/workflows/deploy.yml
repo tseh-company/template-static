@@ -1,0 +1,47 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      DOMAIN: ${{ secrets.DOMAIN }}
+      SUBDOMAIN: ${{ secrets.SUBDOMAIN }}
+      YC_FOLDER_ID: ${{ secrets.YC_FOLDER_ID }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.YC_S3_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.YC_S3_SECRET }}
+      AWS_DEFAULT_REGION: ru-central1
+      AWS_EC2_METADATA_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve site dir (build/dist if exists, else repo root)
+        id: dir
+        run: |
+          if [ -d "dist" ]; then echo "dir=dist" >> "$GITHUB_OUTPUT";
+          elif [ -d "build" ]; then echo "dir=build" >> "$GITHUB_OUTPUT";
+          elif [ -d "public" ]; then echo "dir=public" >> "$GITHUB_OUTPUT";
+          else echo "dir=." >> "$GITHUB_OUTPUT"; fi
+
+      - name: Replace placeholders
+        run: |
+          DIR="${{ steps.dir.outputs.dir }}"
+          find "$DIR" -type f \( -name "*.html" -o -name "*.js" -o -name "*.json" \) -exec \
+            sed -i "s|{{PROJECT_NAME}}|$SUBDOMAIN|g" {} +
+
+      - name: Upload to Object Storage
+        run: |
+          BUCKET="${SUBDOMAIN}.${DOMAIN}"
+          DIR="${{ steps.dir.outputs.dir }}"
+          aws --endpoint-url=https://storage.yandexcloud.net \
+            s3 sync "$DIR" "s3://$BUCKET" \
+            --delete \
+            --cache-control "public, max-age=300"
+          echo "✅ Deployed to https://${SUBDOMAIN}.${DOMAIN}"
